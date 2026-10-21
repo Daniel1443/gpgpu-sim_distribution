@@ -236,6 +236,9 @@ class partition_mf_allocator : public mem_fetch_allocator {
 // channel.
 // - It arbitrates the DRAM channel among multiple sub partitions.
 // - It does not connect directly with the interconnection network.
+
+// GPGPU-Sim_ref.pdf Section 4.3
+// memory_partition_unit 管共用 DRAM channel：協調底下多個 sub-partitions；dram_t 模擬 DRAM 的實際時序。
 class memory_partition_unit {
  public:
   memory_partition_unit(unsigned partition_id, const memory_config *config,
@@ -328,6 +331,7 @@ class memory_partition_unit {
   class gpgpu_sim *m_gpu;
 };
 
+// 接收 interconnect 的 request，處理自己的 L2 cache 與 queues
 class memory_sub_partition {
  public:
   memory_sub_partition(unsigned sub_partition_id, const memory_config *config,

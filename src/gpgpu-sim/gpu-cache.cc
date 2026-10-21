@@ -245,6 +245,11 @@ enum cache_request_status tag_array::probe(new_addr_type addr, unsigned &idx,
   return probe(addr, idx, mask, is_write, probe_mode, mf);
 }
 
+/*
+整個專案最核心的 function:它掃過一個 set 裡所有 way,找 invalid line,
+如果沒有 invalid line 就依 m_config.m_replacement_policy(304~314 行)在 LRU/FIFO 之間選一個 victim line。
+新 policy 就是要在這裡加一個 else-if branch,決定新的 victim 選擇邏輯
+*/
 enum cache_request_status tag_array::probe(new_addr_type addr, unsigned &idx,
                                            mem_access_sector_mask_t mask,
                                            bool is_write, bool probe_mode,
@@ -253,9 +258,9 @@ enum cache_request_status tag_array::probe(new_addr_type addr, unsigned &idx,
   unsigned set_index = m_config.set_index(addr);
   new_addr_type tag = m_config.tag(addr);
 
-  unsigned invalid_line = (unsigned)-1;
-  unsigned valid_line = (unsigned)-1;
-  unsigned long long valid_timestamp = (unsigned)-1;
+  unsigned invalid_line = (unsigned)-1;  // 紀錄找到的空位置
+  unsigned valid_line = (unsigned)-1;    // 紀錄目前選出來的replacement candidate
+  unsigned long long valid_timestamp = (unsigned)-1;  // 拿來比較 LRU/FIFO的時間
   unsigned valid_rrpv = 0;  // SRRIP：目前 victim candidate 的 RRPV
 
   bool all_reserved = true;
@@ -264,13 +269,13 @@ enum cache_request_status tag_array::probe(new_addr_type addr, unsigned &idx,
     unsigned index = set_index * m_config.m_assoc + way;
     cache_block_t *line = m_lines[index];
     if (line->m_tag == tag) {
-      if (line->get_status(mask) == RESERVED) {
+      if (line->get_status(mask) == RESERVED) {  // Tag 相同＋RESERVED：找到對應 block，但資料還在等待中，回傳 HIT_RESERVED
         idx = index;
         return HIT_RESERVED;
-      } else if (line->get_status(mask) == VALID) {
+      } else if (line->get_status(mask) == VALID) {  // Tag 相同＋VALID：資料已有效，回傳 HIT
         idx = index;
         return HIT;
-      } else if (line->get_status(mask) == MODIFIED) {
+      } else if (line->get_status(mask) == MODIFIED) {  
         if ((!is_write && line->is_readable(mask)) || is_write) {
           idx = index;
           return HIT;
@@ -286,7 +291,7 @@ enum cache_request_status tag_array::probe(new_addr_type addr, unsigned &idx,
         assert(line->get_status(mask) == INVALID);
       }
     }
-    if (!line->is_reserved_line()) {
+    if (!line->is_reserved_line()) {  // 位置已預留，但資料還沒回來，不能拿去替換
       // percentage of dirty lines in the cache
       // number of dirty lines / total lines in the cache
       float dirty_line_percentage =
@@ -296,12 +301,21 @@ enum cache_request_status tag_array::probe(new_addr_type addr, unsigned &idx,
       // Then this cacheline is eligible to be considered for replacement
       // candidate i.e. Only evict clean cachelines until total dirty cachelines
       // reach the limit.
+
+      // 優先替換 clean line；dirty line 的比例達到門檻後，才允許替換 dirty line
+      // 原因是替換 dirty line 通常需要 writeback，成本較高；但也不能讓 dirty lines 持續占住 cache
+      /*
+        一條line的status有以下四種
+        INVALID：直接使用這個空位，不需要淘汰資料。
+        VALID／MODIFIED：也可能被替換，但要透過 LRU／FIFO 選出；MODIFIED 還需要 writeback。
+        RESERVED：已經預留給正在等待的資料，不能拿來替換。
+      */
       if (!line->is_modified_line() ||
           dirty_line_percentage >= m_config.m_wr_percent) {
         all_reserved = false;
         if (line->is_invalid_line()) {
           invalid_line = index;
-        } else {
+        } else {  // LRU／FIFO 挑選替換對象
           // valid line : keep track of most appropriate replacement candidate
           if (m_config.m_replacement_policy == LRU) {
             if (line->get_last_access_time() < valid_timestamp) {
@@ -331,11 +345,12 @@ enum cache_request_status tag_array::probe(new_addr_type addr, unsigned &idx,
   }
 
   if (invalid_line != (unsigned)-1) {
-    idx = invalid_line;
+    idx = invalid_line;  // 優先使用空位
   } else if (valid_line != (unsigned)-1) {
-    idx = valid_line;
+    idx = valid_line;    // 沒空位，就用 LRU／FIFO 選出的替換對象
   } else
-    abort();  // if an unreserved block exists, it is either invalid or
+    abort();  // 兩者都沒找到，代表程式狀態不符合預期
+              // if an unreserved block exists, it is either invalid or
               // replaceable
 
   return MISS;
@@ -362,6 +377,15 @@ enum cache_request_status tag_array::access(new_addr_type addr, unsigned time,
   return result;
 }
 
+// 根據 probe() 的結果，更新 cache block
+/*
+看它的 switch，確認三件事：
+- HIT：怎麼更新 last access time？
+- MISS：怎麼處理 dirty victim，再呼叫 allocate()？
+- SECTOR_MISS：怎麼只配置缺少的 sector？
+
+idx 參數是probe 回報命中的line
+*/
 enum cache_request_status tag_array::access(new_addr_type addr, unsigned time,
                                             unsigned &idx, bool &wb,
                                             evicted_block_info &evicted,
@@ -371,7 +395,7 @@ enum cache_request_status tag_array::access(new_addr_type addr, unsigned time,
   shader_cache_access_log(m_core_id, m_type_id, 0);  // log accesses to cache
   enum cache_request_status status = probe(addr, idx, mf, mf->is_write());
   switch (status) {
-    case HIT_RESERVED:
+    case HIT_RESERVED:  // 這個 block 已有位置，但資料還沒回來
       m_pending_hit++;
     case HIT:
       m_lines[idx]->set_last_access_time(time, mf->get_access_sector_mask());
@@ -636,10 +660,24 @@ void mshr_table::mark_ready(new_addr_type block_addr, bool &has_atomic) {
 }
 
 /// Returns next ready access
+// 從資料已返回的 MSHR entry，取出一筆等待中的 request；全部取完後，釋放 entry
+// 每個 L2 slice 各有一個 mshr_table
+/*
+整個 GPU 的 L2
+├── slice 0：l2_cache → 自己的 m_mshrs
+├── slice 1：l2_cache → 自己的 m_mshrs
+└── ...
+*/
+/*
+mshr_table
+└── m_data：hash map
+    ├── 地址 A → entry：[request 1, request 2]
+    └── 地址 B → entry：[request 3]
+*/
 mem_fetch *mshr_table::next_access() {
-  assert(access_ready());
-  new_addr_type block_addr = m_current_response.front();
-  assert(!m_data[block_addr].m_list.empty());
+  assert(access_ready());  // 確認有可以回覆的 request
+  new_addr_type block_addr = m_current_response.front();  // 取得第一個已準備好回覆的 block address
+  assert(!m_data[block_addr].m_list.empty());  // 確認這個 block 還有等待回覆的 requests。
   mem_fetch *result = m_data[block_addr].m_list.front();
   m_data[block_addr].m_list.pop_front();
   if (m_data[block_addr].m_list.empty()) {

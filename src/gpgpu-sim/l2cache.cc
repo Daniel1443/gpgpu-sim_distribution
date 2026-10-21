@@ -75,6 +75,16 @@ mem_fetch *partition_mf_allocator::alloc(
                                 sid, tpc, m_memory_config, cycle, original_mf);
   return mf;
 }
+
+/*
+GPU
+└── chiplets（邏輯分組）
+    └── 多個 memory_partition_unit
+        ├── dram_t：模擬一個 DRAM channel
+        └── 多個 memory_sub_partition
+            ├── l2_cache：一個 L2 slice
+            └── request／response queues
+*/
 memory_partition_unit::memory_partition_unit(
     unsigned partition_id, const memory_config *config,
     class memory_stats_t *stats, class gpgpu_sim *gpu,
@@ -93,6 +103,22 @@ memory_partition_unit::memory_partition_unit(
 
   m_dram = new dram_t(m_id, m_config, m_stats, this, gpu);
 
+  // 建立一個 pointer 陣列，還沒有建立 sub-partition 物件。換行讓它看起來比較怪
+  // m_sub_partition = new memory_sub_partition*[數量];
+  /*
+  m_sub_partition
+    │
+    ▼
+  pointer 陣列                 各自建立的物件
+  ┌──────────────┐
+  │ [0]：pointer ├───────────► memory_sub_partition
+  │              │            ├── L2 slice
+  │              │            └── queues
+  ├──────────────┤
+  │ [1]：pointer ├───────────► memory_sub_partition
+  └──────────────┘             ├── L2 slice
+                               └── queues
+  */
   m_sub_partition = new memory_sub_partition
       *[m_config->m_n_sub_partition_per_memory_channel];
   for (unsigned p = 0; p < m_config->m_n_sub_partition_per_memory_channel;
@@ -209,6 +235,13 @@ bool memory_partition_unit::busy() const {
   return busy;
 }
 
+// 讓此 partition 底下的每個 sub-partition，以同一個 cycle 推進一次
+/*
+memory_partition_unit::cache_cycle(cycle)
+    ├── sub-partition[0]->cache_cycle(cycle)
+    ├── sub-partition[1]->cache_cycle(cycle)
+    └── ...
+*/
 void memory_partition_unit::cache_cycle(unsigned cycle) {
   for (unsigned p = 0; p < m_config->m_n_sub_partition_per_memory_channel;
        p++) {

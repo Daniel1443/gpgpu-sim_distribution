@@ -129,6 +129,11 @@ struct cache_event {
 
 const char *cache_request_status_str(enum cache_request_status status);
 
+
+// Abstract interface for cache blocks.
+// Implementations:
+// - line_cache_block: tracks state for the entire cache line.
+// - sector_cache_block: tracks state for individual sectors.
 struct cache_block_t {
   cache_block_t() {
     m_tag = 0;
@@ -179,7 +184,7 @@ struct cache_block_t {
 };
 
 struct line_cache_block : public cache_block_t {
-  line_cache_block() {
+  line_cache_block() {  // 初始 status、時間怎麼設
     m_alloc_time = 0;
     m_fill_time = 0;
     m_last_access_time = 0;
@@ -193,15 +198,20 @@ struct line_cache_block : public cache_block_t {
                 mem_access_sector_mask_t sector_mask) {
     m_tag = tag;
     m_block_addr = block_addr;
+
+    // 例如：cycle 100 發生 miss 並 allocate，cycle 150 才 fill。
+    // 這兩個事件的時間就是 100 和 150；之後再次存取，last access time 還會更新
     m_alloc_time = time;
     m_last_access_time = time;
-    m_fill_time = 0;
-    m_status = RESERVED;
+    m_fill_time = 0;  // 資料回來並填入 cache 的時間, 資料還沒回來，先重設
+    m_status = RESERVED;  // 在cycle 100 就先reserved? 等fill 回來再改
     m_ignore_on_fill_status = false;
-    m_set_modified_on_fill = false;
-    m_set_readable_on_fill = false;
+    m_set_modified_on_fill = false;  // 資料 fill 回來時，要設成 MODIFIED 還是 VALID
+    m_set_readable_on_fill = false;  
     m_set_byte_mask_on_fill = false;
   }
+
+  // 資料回來後，如何更新 status
   virtual void fill(unsigned time, mem_access_sector_mask_t sector_mask,
                     mem_access_byte_mask_t byte_mask) {
     // if(!m_ignore_on_fill_status)
@@ -520,7 +530,7 @@ struct sector_cache_block : public cache_block_t {
   }
 };
 
-enum replacement_policy_t { LRU, FIFO, SRRIP};
+enum replacement_policy_t { LRU, FIFO, SRRIP};  // TODO: add my custom policy here
 
 enum write_policy_t {
   READ_ONLY,
@@ -579,6 +589,25 @@ class cache_config {
     cache_status = status;
     assert(config);
     char ct, rp, wp, ap, mshr_type, wap, sif;
+    /*
+    EX：
+    The folloing line can read from sth like: gpu-simulator/gpgpu-sim/configs/deprecated-cfgs/SM6\_GTX1080/gpgpusim.config:59
+    N:64:128:6,L:L:m:N:H,A:128:8,8
+    會解析成以下 cache config：
+    ct                    = 'N'
+    m_nset                = 64
+    m_line_sz             = 128   // 每條 line 128 bytes
+    m_assoc               = 6     // 每個 set 有 6 個 way
+    rp                    = 'L'   // LRU
+    wp                    = 'L'
+    ap                    = 'm'   // allocation policy
+    wap                   = 'N'
+    sif                   = 'H'   // set index function
+    mshr_type             = 'A'
+    m_mshr_entries        = 128   // 最多追蹤 128 個不同資料區塊的未完成 miss
+    m_mshr_max_merge      = 8
+    m_miss_queue_size     = 8
+    */
 
     int ntok =
         sscanf(config, "%c:%u:%u:%u,%c:%c:%c:%c:%c,%c:%u:%u,%u:%u,%u", &ct,
@@ -594,6 +623,7 @@ class cache_config {
       exit_parse_error();
     }
 
+    // 開始處理categorical variables
     switch (ct) {
       case 'N':
         m_cache_type = NORMAL;
@@ -604,7 +634,7 @@ class cache_config {
       default:
         exit_parse_error();
     }
-    switch (rp) {
+    switch (rp) {  // replacement policy
       case 'L':
         m_replacement_policy = LRU;
         break;
@@ -1078,10 +1108,12 @@ class mshr_table {
   const unsigned m_max_merged;
 
   struct mshr_entry {
-    std::list<mem_fetch *> m_list;
-    bool m_has_atomic;
+    std::list<mem_fetch *> m_list;  // 合併進來的 request
+    bool m_has_atomic;              // 是否包含 atomic request
     mshr_entry() : m_has_atomic(false) {}
   };
+
+  // address 是 map 的 key，entry 是 value
   typedef tr1_hash_map<new_addr_type, mshr_entry> table;
   typedef tr1_hash_map<new_addr_type, mshr_entry> line_table;
   table m_data;
