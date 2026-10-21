@@ -133,6 +133,7 @@ struct cache_block_t {
   cache_block_t() {
     m_tag = 0;
     m_block_addr = 0;
+    m_rrpv = 3;
   }
 
   virtual void allocate(new_addr_type tag, new_addr_type block_addr,
@@ -174,6 +175,7 @@ struct cache_block_t {
 
   new_addr_type m_tag;
   new_addr_type m_block_addr;
+  unsigned m_rrpv;
 };
 
 struct line_cache_block : public cache_block_t {
@@ -518,7 +520,7 @@ struct sector_cache_block : public cache_block_t {
   }
 };
 
-enum replacement_policy_t { LRU, FIFO };
+enum replacement_policy_t { LRU, FIFO, SRRIP};
 
 enum write_policy_t {
   READ_ONLY,
@@ -608,6 +610,9 @@ class cache_config {
         break;
       case 'F':
         m_replacement_policy = FIFO;
+        break;
+      case 'S':
+        m_replacement_policy = SRRIP;
         break;
       default:
         exit_parse_error();
@@ -999,6 +1004,7 @@ class tag_array {
   tag_array(cache_config &config, int core_id, int type_id,
             cache_block_t **new_lines);
   void init(int core_id, int type_id);
+  void srrip_age_set(unsigned victim_idx);
 
  protected:
   cache_config &m_config;

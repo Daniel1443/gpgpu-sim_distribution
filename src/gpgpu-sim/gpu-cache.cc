@@ -31,6 +31,7 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #include "gpu-cache.h"
+#include <algorithm>
 #include <assert.h>
 #include <cstdint>
 #include "gpu-sim.h"
@@ -255,6 +256,7 @@ enum cache_request_status tag_array::probe(new_addr_type addr, unsigned &idx,
   unsigned invalid_line = (unsigned)-1;
   unsigned valid_line = (unsigned)-1;
   unsigned long long valid_timestamp = (unsigned)-1;
+  unsigned valid_rrpv = 0;  // SRRIP：目前 victim candidate 的 RRPV
 
   bool all_reserved = true;
   // check for hit or pending hit
@@ -311,6 +313,12 @@ enum cache_request_status tag_array::probe(new_addr_type addr, unsigned &idx,
               valid_timestamp = line->get_alloc_time();
               valid_line = index;
             }
+          } else if (m_config.m_replacement_policy == SRRIP) {
+            // victim = RRPV 最大的 line，同分取最小 way；aging 在 access()/fill()
+            if (valid_line == (unsigned)-1 || line->m_rrpv > valid_rrpv) {
+              valid_rrpv = line->m_rrpv;
+              valid_line = index;
+            }
           }
         }
       }
@@ -331,6 +339,18 @@ enum cache_request_status tag_array::probe(new_addr_type addr, unsigned &idx,
               // replaceable
 
   return MISS;
+}
+
+// SRRIP aging：victim (idx) 的 RRPV 不到 3 時，整個 set 一起加到 victim 變 3
+// 等價於「找不到 RRPV=3 就全 set +1 直到出現」，放在這裡是因為 probe() 是 const
+void tag_array::srrip_age_set(unsigned idx) {
+  unsigned delta = 3 - m_lines[idx]->m_rrpv;
+  if (delta == 0) return;
+  unsigned set_start = (idx / m_config.m_assoc) * m_config.m_assoc;
+  for (unsigned way = 0; way < m_config.m_assoc; way++) {
+    cache_block_t *line = m_lines[set_start + way];
+    line->m_rrpv = std::min(3u, line->m_rrpv + delta);
+  }
 }
 
 enum cache_request_status tag_array::access(new_addr_type addr, unsigned time,
@@ -355,6 +375,9 @@ enum cache_request_status tag_array::access(new_addr_type addr, unsigned time,
       m_pending_hit++;
     case HIT:
       m_lines[idx]->set_last_access_time(time, mf->get_access_sector_mask());
+      if (m_config.m_replacement_policy == SRRIP) {
+        m_lines[idx]->m_rrpv = 0;
+      }
       break;
     case MISS:
       m_miss++;
@@ -369,8 +392,12 @@ enum cache_request_status tag_array::access(new_addr_type addr, unsigned time,
                            m_lines[idx]->get_dirty_sector_mask());
           m_dirty--;
         }
+        if (m_config.m_replacement_policy == SRRIP) srrip_age_set(idx);
         m_lines[idx]->allocate(m_config.tag(addr), m_config.block_addr(addr),
                                time, mf->get_access_sector_mask());
+        if (m_config.m_replacement_policy == SRRIP) {
+          m_lines[idx]->m_rrpv = 2;
+        }
       }
       break;
     case SECTOR_MISS:
@@ -384,6 +411,10 @@ enum cache_request_status tag_array::access(new_addr_type addr, unsigned time,
         if (before && !m_lines[idx]->is_modified_line()) {
           m_dirty--;
         }
+      }
+      // 同一條 line 又被存取一次，視同 hit
+      if (m_config.m_replacement_policy == SRRIP) {
+        m_lines[idx]->m_rrpv = 0;
       }
       break;
     case RESERVATION_FAIL:
@@ -421,8 +452,10 @@ void tag_array::fill(new_addr_type addr, unsigned time,
   // assert(status==MISS||status==SECTOR_MISS); // MSHR should have prevented
   // redundant memory request
   if (status == MISS) {
+    if (m_config.m_replacement_policy == SRRIP) srrip_age_set(idx);
     m_lines[idx]->allocate(m_config.tag(addr), m_config.block_addr(addr), time,
                            mask);
+    if (m_config.m_replacement_policy == SRRIP) m_lines[idx]->m_rrpv = 2;
   } else if (status == SECTOR_MISS) {
     assert(m_config.m_cache_type == SECTOR);
     ((sector_cache_block *)m_lines[idx])->allocate_sector(time, mask);
