@@ -262,13 +262,15 @@ void tag_array::kernel_boundary_refresh() {
       line->m_boundary_protected = false;
       if (line->is_valid_line()) valid.push_back(set_start + way);
     }
-    // KASR2: protect at most N lines per set, preferring the ones the
-    // finishing kernel used most recently (lowest RRPV, then latest access)
-    if (m_config.m_replacement_policy == KASR2) {
+    // KASR2/KASR2L: protect at most N lines per set, preferring the ones the
+    // finishing kernel used most recently (lowest RRPV if the policy keeps
+    // one, then latest access)
+    if (m_config.m_replacement_policy == KASR2 ||
+        m_config.m_replacement_policy == KASR2L) {
       unsigned n =
           std::min<unsigned>(m_config.m_kasr_protect_ways, valid.size());
       std::stable_sort(valid.begin(), valid.end(), [&](unsigned a, unsigned b) {
-        if (m_lines[a]->m_rrpv != m_lines[b]->m_rrpv)
+        if (m_config.uses_rrpv() && m_lines[a]->m_rrpv != m_lines[b]->m_rrpv)
           return m_lines[a]->m_rrpv < m_lines[b]->m_rrpv;
         return m_lines[a]->get_last_access_time() >
                m_lines[b]->get_last_access_time();
@@ -328,6 +330,7 @@ enum cache_request_status tag_array::probe(new_addr_type addr, unsigned &idx,
   // every line in the set happens to be protected).
   unsigned valid_line_protected = (unsigned)-1;
   unsigned valid_rrpv_protected = 0;
+  unsigned long long valid_timestamp_protected = (unsigned)-1;  // KASR2L
 
   bool all_reserved = true;
   // check for hit or pending hit
@@ -413,6 +416,18 @@ enum cache_request_status tag_array::probe(new_addr_type addr, unsigned &idx,
                 valid_line = index;
               }
             }
+          } else if (m_config.m_replacement_policy == KASR2L) {
+            // same protected/unprotected split as KASR2, LRU within each
+            unsigned long long t = line->get_last_access_time();
+            if (line->m_boundary_protected) {
+              if (t < valid_timestamp_protected) {
+                valid_timestamp_protected = t;
+                valid_line_protected = index;
+              }
+            } else if (t < valid_timestamp) {
+              valid_timestamp = t;
+              valid_line = index;
+            }
           }
         }
       }
@@ -428,10 +443,11 @@ enum cache_request_status tag_array::probe(new_addr_type addr, unsigned &idx,
     idx = invalid_line;  // 優先使用空位
   } else if (valid_line != (unsigned)-1) {
     idx = valid_line;    // 沒空位，就用 LRU／FIFO 選出的替換對象
-  } else if (m_config.m_replacement_policy == KASR2 &&
+  } else if ((m_config.m_replacement_policy == KASR2 ||
+              m_config.m_replacement_policy == KASR2L) &&
              valid_line_protected != (unsigned)-1) {
     // every candidate in this set is boundary_protected -- fall back to
-    // normal SRRIP victim selection among them
+    // the policy's normal victim selection among them
     idx = valid_line_protected;
   } else
     abort();  // 兩者都沒找到，代表程式狀態不符合預期
@@ -479,7 +495,8 @@ enum cache_request_status tag_array::access(new_addr_type addr, unsigned time,
   is_used = true;
   shader_cache_access_log(m_core_id, m_type_id, 0);  // log accesses to cache
   if ((m_config.m_replacement_policy == KASR ||
-       m_config.m_replacement_policy == KASR2) &&
+       m_config.m_replacement_policy == KASR2 ||
+       m_config.m_replacement_policy == KASR2L) &&
       g_l2_study_current_kid != m_last_seen_kid) {
     kernel_boundary_refresh();
     m_last_seen_kid = g_l2_study_current_kid;
@@ -520,7 +537,8 @@ enum cache_request_status tag_array::access(new_addr_type addr, unsigned time,
         if (m_config.uses_rrpv()) {
           m_lines[idx]->m_rrpv = 2;
         }
-        if (m_config.m_replacement_policy == KASR2) {
+        if (m_config.m_replacement_policy == KASR2 ||
+            m_config.m_replacement_policy == KASR2L) {
           // new data occupying this line -- it hasn't earned protection yet
           m_lines[idx]->m_boundary_protected = false;
         }
@@ -582,7 +600,8 @@ void tag_array::fill(new_addr_type addr, unsigned time,
     m_lines[idx]->allocate(m_config.tag(addr), m_config.block_addr(addr), time,
                            mask);
     if (m_config.uses_rrpv()) m_lines[idx]->m_rrpv = 2;
-    if (m_config.m_replacement_policy == KASR2) {
+    if (m_config.m_replacement_policy == KASR2 ||
+        m_config.m_replacement_policy == KASR2L) {
       m_lines[idx]->m_boundary_protected = false;
     }
   } else if (status == SECTOR_MISS) {

@@ -535,8 +535,9 @@ struct sector_cache_block : public cache_block_t {
   }
 };
 
-// KASR: SRRIP + kernel-boundary RRPV refresh; KASR2: + sticky protection bit
-enum replacement_policy_t { LRU, FIFO, SRRIP, KASR, KASR2 };
+// KASR: SRRIP + kernel-boundary RRPV refresh; KASR2: + sticky protection bit;
+// KASR2L: KASR2's protection with LRU instead of SRRIP victim selection
+enum replacement_policy_t { LRU, FIFO, SRRIP, KASR, KASR2, KASR2L };
 
 enum write_policy_t {
   READ_ONLY,
@@ -656,6 +657,9 @@ class cache_config {
         break;
       case 'P':
         m_replacement_policy = KASR2;
+        break;
+      case 'U':
+        m_replacement_policy = KASR2L;
         break;
       default:
         exit_parse_error();
