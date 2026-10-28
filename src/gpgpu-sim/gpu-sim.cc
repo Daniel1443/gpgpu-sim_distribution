@@ -268,6 +268,12 @@ void memory_config::reg_options(class OptionParser *opp) {
       "KASR2 L2 policy: max lines per set protected at a kernel boundary "
       "(>= assoc protects every valid line)",
       "24");
+  option_parser_register(
+      opp, "-gpgpu_l2_kasr_decay_misses", OPT_UINT32,
+      &m_L2_config.m_kasr_decay_misses,
+      "KASR2 L2 policy: unprotect a set after this many misses since the "
+      "kernel boundary (0 = never)",
+      "0");
   option_parser_register(opp, "-gpgpu_cache:dl2_texture_only", OPT_BOOL,
                          &m_L2_texure_only, "L2 cache used for texture only",
                          "1");

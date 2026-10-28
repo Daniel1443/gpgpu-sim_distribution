@@ -591,6 +591,7 @@ class cache_config {
     m_is_streaming = false;
     m_wr_percent = 0;
     m_kasr_protect_ways = (unsigned)-1;
+    m_kasr_decay_misses = 0;
   }
   void init(char *config, FuncCache status) {
     cache_status = status;
@@ -899,6 +900,8 @@ class cache_config {
   unsigned m_wr_percent;
   unsigned m_kasr_protect_ways;  // KASR2: max protected lines per set at a
                                  // kernel boundary (>= assoc: protect all)
+  unsigned m_kasr_decay_misses;  // KASR2: unprotect a set after this many
+                                 // misses since the boundary (0: never)
   write_allocate_policy_t get_write_allocate_policy() {
     return m_write_alloc_policy;
   }
@@ -1082,6 +1085,8 @@ class tag_array {
 
   // KASR/KASR2: last kernel id seen, to detect a kernel-launch boundary
   unsigned m_last_seen_kid;
+  // KASR2: per-set misses since the last kernel boundary (protection decay)
+  std::vector<unsigned> m_kasr_set_misses;
 
   bool is_used;  // a flag if the whole cache has ever been accessed before
 

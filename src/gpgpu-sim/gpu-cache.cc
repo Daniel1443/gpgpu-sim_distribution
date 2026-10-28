@@ -253,6 +253,7 @@ void tag_array::init(int core_id, int type_id) {
 // replacing it).
 void tag_array::kernel_boundary_refresh() {
   unsigned assoc = m_config.m_assoc;
+  m_kasr_set_misses.assign(m_config.m_nset, 0);
   std::vector<unsigned> valid;
   for (unsigned set_start = 0; set_start < m_config.get_num_lines();
        set_start += assoc) {
@@ -523,6 +524,15 @@ enum cache_request_status tag_array::access(new_addr_type addr, unsigned time,
         if (m_config.m_replacement_policy == KASR2) {
           // new data occupying this line -- it hasn't earned protection yet
           m_lines[idx]->m_boundary_protected = false;
+          // decay: after K misses the next kernel's startup burst is over,
+          // so release the whole set back to plain SRRIP
+          unsigned set = idx / m_config.m_assoc;
+          if (m_config.m_kasr_decay_misses &&
+              ++m_kasr_set_misses[set] == m_config.m_kasr_decay_misses) {
+            for (unsigned way = 0; way < m_config.m_assoc; way++)
+              m_lines[set * m_config.m_assoc + way]->m_boundary_protected =
+                  false;
+          }
         }
       }
       break;
