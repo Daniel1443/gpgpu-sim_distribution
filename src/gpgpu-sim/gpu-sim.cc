@@ -262,6 +262,12 @@ void memory_config::reg_options(class OptionParser *opp) {
       " {<sector?>:<nsets>:<bsize>:<assoc>,<rep>:<wr>:<alloc>:<wr_alloc>:<set_"
       "index_fn>,<mshr>:<N>:<merge>,<mq>:<fifo_entry>,<data_port_width>",
       "S:32:128:24,L:B:m:L:P,A:192:4,32:0,32");
+  option_parser_register(
+      opp, "-gpgpu_l2_kasr_protect_ways", OPT_UINT32,
+      &m_L2_config.m_kasr_protect_ways,
+      "KASR2 L2 policy: max lines per set protected at a kernel boundary "
+      "(>= assoc protects every valid line)",
+      "24");
   option_parser_register(opp, "-gpgpu_cache:dl2_texture_only", OPT_BOOL,
                          &m_L2_texure_only, "L2 cache used for texture only",
                          "1");
@@ -845,8 +851,14 @@ void increment_x_then_y_then_z(dim3 &i, const dim3 &bound) {
   }
 }
 
+// L2 replacement-policy study: tracks which kernel is "current" for the
+// KASR/KASR2 kernel-boundary detection and the L2 access log in gpu-cache.cc
+// (only meaningful without concurrent kernels).
+extern unsigned g_l2_study_current_kid;
+
 void gpgpu_sim::launch(kernel_info_t *kinfo) {
   unsigned kernelID = kinfo->get_uid();
+  g_l2_study_current_kid = kernelID;
   unsigned long long streamID = kinfo->get_streamID();
 
   kernel_time_t kernel_time = {gpu_tot_sim_cycle + gpu_sim_cycle, 0};

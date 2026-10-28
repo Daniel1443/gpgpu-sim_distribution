@@ -139,6 +139,7 @@ struct cache_block_t {
     m_tag = 0;
     m_block_addr = 0;
     m_rrpv = 3;
+    m_boundary_protected = false;
   }
 
   virtual void allocate(new_addr_type tag, new_addr_type block_addr,
@@ -181,6 +182,10 @@ struct cache_block_t {
   new_addr_type m_tag;
   new_addr_type m_block_addr;
   unsigned m_rrpv;
+  bool m_boundary_protected;  // KASR2: set on every kernel boundary this line
+                              // survives to; cleared when the line is
+                              // reallocated (new data, not the protected
+                              // generation)
 };
 
 struct line_cache_block : public cache_block_t {
@@ -530,7 +535,8 @@ struct sector_cache_block : public cache_block_t {
   }
 };
 
-enum replacement_policy_t { LRU, FIFO, SRRIP};  // TODO: add my custom policy here
+// KASR: SRRIP + kernel-boundary RRPV refresh; KASR2: + sticky protection bit
+enum replacement_policy_t { LRU, FIFO, SRRIP, KASR, KASR2 };
 
 enum write_policy_t {
   READ_ONLY,
@@ -584,6 +590,7 @@ class cache_config {
     m_set_index_function = LINEAR_SET_FUNCTION;
     m_is_streaming = false;
     m_wr_percent = 0;
+    m_kasr_protect_ways = (unsigned)-1;
   }
   void init(char *config, FuncCache status) {
     cache_status = status;
@@ -643,6 +650,12 @@ class cache_config {
         break;
       case 'S':
         m_replacement_policy = SRRIP;
+        break;
+      case 'K':
+        m_replacement_policy = KASR;
+        break;
+      case 'P':
+        m_replacement_policy = KASR2;
         break;
       default:
         exit_parse_error();
@@ -884,10 +897,16 @@ class cache_config {
   char *m_config_stringPrefShared;
   FuncCache cache_status;
   unsigned m_wr_percent;
+  unsigned m_kasr_protect_ways;  // KASR2: max protected lines per set at a
+                                 // kernel boundary (>= assoc: protect all)
   write_allocate_policy_t get_write_allocate_policy() {
     return m_write_alloc_policy;
   }
   write_policy_t get_write_policy() { return m_write_policy; }
+  bool uses_rrpv() const {  // SRRIP and the KASR policies built on it
+    return m_replacement_policy == SRRIP || m_replacement_policy == KASR ||
+           m_replacement_policy == KASR2;
+  }
 
  protected:
   void exit_parse_error() {
@@ -1035,6 +1054,9 @@ class tag_array {
             cache_block_t **new_lines);
   void init(int core_id, int type_id);
   void srrip_age_set(unsigned victim_idx);
+  // KASR/KASR2: reset RRPV=0 on every kernel launch; KASR2 also re-picks
+  // protected lines
+  void kernel_boundary_refresh();
 
  protected:
   cache_config &m_config;
@@ -1057,6 +1079,9 @@ class tag_array {
 
   int m_core_id;  // which shader core is using this
   int m_type_id;  // what kind of cache is this (normal, texture, constant)
+
+  // KASR/KASR2: last kernel id seen, to detect a kernel-launch boundary
+  unsigned m_last_seen_kid;
 
   bool is_used;  // a flag if the whole cache has ever been accessed before
 

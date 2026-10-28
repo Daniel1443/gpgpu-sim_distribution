@@ -66,6 +66,28 @@ const char *cache_fail_status_str(enum cache_reservation_fail_reason status) {
   return static_cache_reservation_fail_reason_str[status];
 }
 
+// L2 replacement-policy study: id of the kernel currently running,
+// updated by gpgpu_sim::launch() (gpu-sim.cc) at each kernel launch.
+// Only meaningful because this project's configs don't enable concurrent
+// kernels (MULTI_KERNEL) -- otherwise "current kernel" would be ambiguous.
+unsigned g_l2_study_current_kid = 0;
+
+// L2 replacement-policy study: optional per-access log of the L2's
+// hit/miss decisions. Enabled only when L2_ACCESS_LOG points to a
+// writable path; no effect (and no overhead) otherwise.
+static FILE *l2_access_log_file() {
+  static FILE *f = nullptr;
+  static bool initialized = false;
+  if (!initialized) {
+    initialized = true;
+    if (const char *path = getenv("L2_ACCESS_LOG")) {
+      f = fopen(path, "w");
+      if (f) fprintf(f, "time,addr,set_index,status,kid\n");
+    }
+  }
+  return f;
+}
+
 unsigned l1d_cache_config::set_bank(new_addr_type addr) const {
   // For sector cache, we select one sector per bank (sector interleaving)
   // This is what was found in Volta (one sector per bank, sector interleaving)
@@ -218,6 +240,44 @@ void tag_array::init(int core_id, int type_id) {
   m_type_id = type_id;
   is_used = false;
   m_dirty = 0;
+  m_last_seen_kid = (unsigned)-1;
+}
+
+// KASR: on every kernel launch, give every still-resident line one more
+// "most recently used" life (RRPV=0). Surviving to a kernel boundary is
+// itself evidence a line may be needed by the next kernel -- see the
+// cross-kernel-reuse finding in the backprop/bfs L2 study (FIFO's incidental
+// insertion-order protection captured this in backprop but misfired in bfs,
+// where the working set keeps growing; this makes the protection explicit
+// and layers it on top of SRRIP's existing recency tracking instead of
+// replacing it).
+void tag_array::kernel_boundary_refresh() {
+  unsigned assoc = m_config.m_assoc;
+  std::vector<unsigned> valid;
+  for (unsigned set_start = 0; set_start < m_config.get_num_lines();
+       set_start += assoc) {
+    valid.clear();
+    for (unsigned way = 0; way < assoc; way++) {
+      cache_block_t *line = m_lines[set_start + way];
+      line->m_boundary_protected = false;
+      if (line->is_valid_line()) valid.push_back(set_start + way);
+    }
+    // KASR2: protect at most N lines per set, preferring the ones the
+    // finishing kernel used most recently (lowest RRPV, then latest access)
+    if (m_config.m_replacement_policy == KASR2) {
+      unsigned n =
+          std::min<unsigned>(m_config.m_kasr_protect_ways, valid.size());
+      std::stable_sort(valid.begin(), valid.end(), [&](unsigned a, unsigned b) {
+        if (m_lines[a]->m_rrpv != m_lines[b]->m_rrpv)
+          return m_lines[a]->m_rrpv < m_lines[b]->m_rrpv;
+        return m_lines[a]->get_last_access_time() >
+               m_lines[b]->get_last_access_time();
+      });
+      for (unsigned i = 0; i < n; i++)
+        m_lines[valid[i]]->m_boundary_protected = true;
+    }
+    for (unsigned idx : valid) m_lines[idx]->m_rrpv = 0;
+  }
 }
 
 void tag_array::add_pending_line(mem_fetch *mf) {
@@ -262,6 +322,12 @@ enum cache_request_status tag_array::probe(new_addr_type addr, unsigned &idx,
   unsigned valid_line = (unsigned)-1;    // 紀錄目前選出來的replacement candidate
   unsigned long long valid_timestamp = (unsigned)-1;  // 拿來比較 LRU/FIFO的時間
   unsigned valid_rrpv = 0;  // SRRIP：目前 victim candidate 的 RRPV
+  // KASR2: prefer evicting a line that is NOT boundary_protected; only
+  // consider protected lines as a fallback when the set has no unprotected
+  // candidate (tracked separately so protection doesn't block eviction when
+  // every line in the set happens to be protected).
+  unsigned valid_line_protected = (unsigned)-1;
+  unsigned valid_rrpv_protected = 0;
 
   bool all_reserved = true;
   // check for hit or pending hit
@@ -327,11 +393,25 @@ enum cache_request_status tag_array::probe(new_addr_type addr, unsigned &idx,
               valid_timestamp = line->get_alloc_time();
               valid_line = index;
             }
-          } else if (m_config.m_replacement_policy == SRRIP) {
+          } else if (m_config.m_replacement_policy == SRRIP ||
+                     m_config.m_replacement_policy == KASR) {
             // victim = RRPV 最大的 line，同分取最小 way；aging 在 access()/fill()
             if (valid_line == (unsigned)-1 || line->m_rrpv > valid_rrpv) {
               valid_rrpv = line->m_rrpv;
               valid_line = index;
+            }
+          } else if (m_config.m_replacement_policy == KASR2) {
+            if (line->m_boundary_protected) {
+              if (valid_line_protected == (unsigned)-1 ||
+                  line->m_rrpv > valid_rrpv_protected) {
+                valid_rrpv_protected = line->m_rrpv;
+                valid_line_protected = index;
+              }
+            } else {
+              if (valid_line == (unsigned)-1 || line->m_rrpv > valid_rrpv) {
+                valid_rrpv = line->m_rrpv;
+                valid_line = index;
+              }
             }
           }
         }
@@ -348,6 +428,11 @@ enum cache_request_status tag_array::probe(new_addr_type addr, unsigned &idx,
     idx = invalid_line;  // 優先使用空位
   } else if (valid_line != (unsigned)-1) {
     idx = valid_line;    // 沒空位，就用 LRU／FIFO 選出的替換對象
+  } else if (m_config.m_replacement_policy == KASR2 &&
+             valid_line_protected != (unsigned)-1) {
+    // every candidate in this set is boundary_protected -- fall back to
+    // normal SRRIP victim selection among them
+    idx = valid_line_protected;
   } else
     abort();  // 兩者都沒找到，代表程式狀態不符合預期
               // if an unreserved block exists, it is either invalid or
@@ -393,13 +478,26 @@ enum cache_request_status tag_array::access(new_addr_type addr, unsigned time,
   m_access++;
   is_used = true;
   shader_cache_access_log(m_core_id, m_type_id, 0);  // log accesses to cache
+  if ((m_config.m_replacement_policy == KASR ||
+       m_config.m_replacement_policy == KASR2) &&
+      g_l2_study_current_kid != m_last_seen_kid) {
+    kernel_boundary_refresh();
+    m_last_seen_kid = g_l2_study_current_kid;
+  }
   enum cache_request_status status = probe(addr, idx, mf, mf->is_write());
+  if (m_core_id == -1) {  // L2 cache only (see l2cache.cc: core_id=-1)
+    if (FILE *log = l2_access_log_file()) {
+      fprintf(log, "%u,0x%llx,%u,%s,%u\n", time, (unsigned long long)addr,
+              m_config.set_index(addr), cache_request_status_str(status),
+              g_l2_study_current_kid);
+    }
+  }
   switch (status) {
     case HIT_RESERVED:  // 這個 block 已有位置，但資料還沒回來
       m_pending_hit++;
     case HIT:
       m_lines[idx]->set_last_access_time(time, mf->get_access_sector_mask());
-      if (m_config.m_replacement_policy == SRRIP) {
+      if (m_config.uses_rrpv()) {
         m_lines[idx]->m_rrpv = 0;
       }
       break;
@@ -416,11 +514,15 @@ enum cache_request_status tag_array::access(new_addr_type addr, unsigned time,
                            m_lines[idx]->get_dirty_sector_mask());
           m_dirty--;
         }
-        if (m_config.m_replacement_policy == SRRIP) srrip_age_set(idx);
+        if (m_config.uses_rrpv()) srrip_age_set(idx);
         m_lines[idx]->allocate(m_config.tag(addr), m_config.block_addr(addr),
                                time, mf->get_access_sector_mask());
-        if (m_config.m_replacement_policy == SRRIP) {
+        if (m_config.uses_rrpv()) {
           m_lines[idx]->m_rrpv = 2;
+        }
+        if (m_config.m_replacement_policy == KASR2) {
+          // new data occupying this line -- it hasn't earned protection yet
+          m_lines[idx]->m_boundary_protected = false;
         }
       }
       break;
@@ -437,7 +539,7 @@ enum cache_request_status tag_array::access(new_addr_type addr, unsigned time,
         }
       }
       // 同一條 line 又被存取一次，視同 hit
-      if (m_config.m_replacement_policy == SRRIP) {
+      if (m_config.uses_rrpv()) {
         m_lines[idx]->m_rrpv = 0;
       }
       break;
@@ -476,10 +578,13 @@ void tag_array::fill(new_addr_type addr, unsigned time,
   // assert(status==MISS||status==SECTOR_MISS); // MSHR should have prevented
   // redundant memory request
   if (status == MISS) {
-    if (m_config.m_replacement_policy == SRRIP) srrip_age_set(idx);
+    if (m_config.uses_rrpv()) srrip_age_set(idx);
     m_lines[idx]->allocate(m_config.tag(addr), m_config.block_addr(addr), time,
                            mask);
-    if (m_config.m_replacement_policy == SRRIP) m_lines[idx]->m_rrpv = 2;
+    if (m_config.uses_rrpv()) m_lines[idx]->m_rrpv = 2;
+    if (m_config.m_replacement_policy == KASR2) {
+      m_lines[idx]->m_boundary_protected = false;
+    }
   } else if (status == SECTOR_MISS) {
     assert(m_config.m_cache_type == SECTOR);
     ((sector_cache_block *)m_lines[idx])->allocate_sector(time, mask);
